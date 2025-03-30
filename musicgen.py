@@ -1,7 +1,5 @@
-from transformers import AutoProcessor, MusicgenForConditionalGeneration, Trainer, TrainingArguments
+from transformers import EncodecModel, AutoProcessor, MusicgenForConditionalGeneration, Trainer, TrainingArguments
 import torch
-import math
-import torchaudio
 from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -10,177 +8,197 @@ from torch.nn.utils.rnn import pad_sequence
 from datasets import load_dataset
 import torch.nn as nn
 from torch.utils.data import DataLoader, ConcatDataset, Subset
+import torch.nn.functional as F
+import torchaudio
+import pandas as pd
+from torch.utils.data import Subset
+import os
+import torch
+import numpy as np
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
 
-torch.cuda.set_per_process_memory_fraction(0.8, device=torch.device('cuda:0'))
-torch.backends.cuda.matmul.allow_tf32 = True #
-def collate_fn(batch):
-
-    audio_tensors = [torch.tensor(item["audio"]["array"]) for item in batch]
-    
-    padded_audio_features = pad_sequence(audio_tensors, batch_first=True) # audio has different lengths
-
-    padded_audio_features = padded_audio_features.unsqueeze(1).float()
-    
-    sampling_rates = [item["audio"]["sampling_rate"] for item in batch]  # List of sampling rates
-    text_prompts = [item["text"] for item in batch]  # List of text prompts
-    
-    return padded_audio_features, sampling_rates, text_prompts
-
-
-def model_training(train_loader, valid_loader, save_path, num_epochs=10):
+def load_model():
     processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
-    model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small")
-    model.custom_linear = nn.Linear(2048, 128) # for memory concern
+    model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").to("cuda")
+    
+    # Debug print to check pad_token_id
+    print("Initial pad_token_id:", model.config.pad_token_id)
+    # source https://huggingface.co/facebook/musicgen-small/blob/main/generation_config.json
+    model.config.decoder_start_token_id = 2048
 
-    # Move the new layer to GPU as well
-    model.custom_linear = model.custom_linear.to("cuda")
-    model = model.to("cuda")
-    model.train()
+    model.train()  # Set to training mode
+    return model, processor
 
 
-    optimizer = Adam(model.parameters(), lr=5e-5)
 
-    mel_spectrogram_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=2000,
-        n_mels=128,  # Set to 2048 to match the feature dimension
-        hop_length=128,  # Adjust as necessary to get the correct number of time steps
-        n_fft=1024  # Use a higher n_fft to capture more frequency details
-    )
-    mel_spectrogram_transform = mel_spectrogram_transform.to("cuda")
-    mse_loss = torch.nn.MSELoss()
+def normalize_audio(waveform):
+    """
+    Normalize waveform to [-1, 1] range.
+    """
+    waveform = torch.tensor(waveform, dtype=torch.float32)  # Convert to tensor
+    waveform = waveform - waveform.mean()  # Remove DC offset
+    waveform = waveform / torch.max(torch.abs(waveform))  # Normalize to [-1, 1]
+    return waveform
 
-    # feature_reducer = nn.Linear(2048, 128)
 
-    # Training loop
-    num_epochs = 10 # Define the number of epochs
-    low_val_loss = math.inf
+def preprocess_audio(batch, model, processor):
+    """
+    Preprocesses audio by normalizing, resampling, and tokenizing it into discrete representations.
+    """
+    waveform = batch["audio"]["array"]  # e.g., shape: (129545,)
+    waveform = normalize_audio(waveform)  # Normalize to [-1, 1]
+    resampler = torchaudio.transforms.Resample(orig_freq=16000, new_freq=32000)
+    waveform = resampler(waveform)  # Resample to 32kHz for the compression model
+    compression_model = EncodecModel.from_pretrained("facebook/encodec_32khz")
+    compression_model = compression_model.to("cuda")  
+
+    with torch.no_grad():
+        inputs = processor(waveform, sampling_rate=32000, return_tensors="pt").to("cuda")
+        tokens = compression_model.encode(inputs["input_values"])  # Encode to discrete tokens
+    return {"tokens": tokens[0]}  # Select the first token stream
+
+def load_and_process_dataset(model, data_dir, metadata_csv):
+    metadata_df = pd.read_csv(metadata_csv)
+    metadata_dict = dict(zip(metadata_df["file_name"], metadata_df["text"]))
+    
+    def add_text_prompt(example):
+        file_path = example.get("audio", {}).get("path", None)
+        if file_path is None:
+            example["text"] = ""
+            return example
+
+        # Define the root path that should be removed.
+        root_path = Path("/usr/project/xtmp/wx83/my_dataset")
+        try:
+            # Extract the relative path, e.g. "data/train/_0-2meOf9qY_1.wav"
+            relative_path = Path(file_path).relative_to(root_path)
+        except ValueError:
+            # If the file_path is not under root_path, use it as is.
+            relative_path = Path(file_path)
+
+        key = str(relative_path)  # key will be "data/train/_0-2meOf9qY_1.wav"
+        # print(f"text search key = {key}")  # Debug: Check the key used for lookup
+        example["text"] = metadata_dict.get(key, "")
+        print(f"example text = {example['text']}")  # Debug: Check the text prompt added to the example
+        return example
+    
+    processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+    dataset = load_dataset("audiofolder", data_dir=data_dir)['train']
+    print(f"load dataset = {dataset[0]}")
+    dataset = dataset.map(add_text_prompt, num_proc=1)
+    # your custom preprocess_audio function to every single example in your dataset
+    dataset = dataset.map(lambda batch: preprocess_audio(batch, model, processor), batched=False)
+    dataset = dataset.remove_columns(["label"])
+
+        
+
+    return dataset
+
+
+def custom_collate_fn(batch):
+    # Process tokens: each is assumed to be shape (1, 1, 4, T)
+    token_tensors = [torch.tensor(example["tokens"]) for example in batch]
+    max_len = max(t.shape[-1] for t in token_tensors)
+    
+    # Pad each token tensor along the last dimension (time dimension)
+    padded_tokens = [F.pad(t, (0, max_len - t.shape[-1])) for t in token_tensors]
+    
+    # Stack tokens into a single tensor of shape (B, 1, 1, 4, max_len)
+    tokens = torch.stack(padded_tokens)
+    
+    # Collect text prompts from the batch (assuming they are raw strings)
+    texts = [example["text"] for example in batch]
+    
+    return {"tokens": tokens, "text": texts}
+
+def train_model(model, train_loader, processor, num_epochs=10, learning_rate=1e-4):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    pad_token_id = model.generation_config.pad_token_id  # Use pad token from generation config
+    model.train()  # Ensure model is in training mode
+
     for epoch in range(num_epochs):
+        print(f"Starting epoch {epoch+1}/{num_epochs}...")
         total_loss = 0
+        for batch in train_loader:
+            optimizer.zero_grad()
 
-        for audio_features, sampling_rates, text_prompts in train_loader:
-
-            audio_features = audio_features.to("cuda")
-
-            inputs = processor(
-                text=text_prompts,
+            # Process text prompt (expects a list of strings)
+            text_prompt = batch["text"]
+            text_inputs = processor(
+                text=text_prompt,
                 padding=True,
-                return_tensors="pt",
-                truncation=True
-            ).to("cuda")  # Move text inputs to GPU
-            inputs['input_values'] = audio_features # continuation
-            outputs = model(**inputs).logits  # Use `last_hidden_state` or appropriate output
-            outputs = outputs.float()  # Ensure the output is in float format
-            outputs = outputs.to("cuda")
+                truncation=True,
+                return_tensors="pt"
+            )
+            # Move all text tensors to CUDA
+            text_inputs = {k: v.to("cuda") for k, v in text_inputs.items()} # (batch_size, sequence_length)
 
-            # take the last 
-            # outputs = outputs[-1, :, :].unsqueeze(0) # [1, 250, 2048]
-            outputs = outputs.mean(dim=0, keepdim=True)  # average should close to GT
-            outputs = model.custom_linear(outputs) # [1, 250, 128]
-            outputs = outputs.permute(0, 2, 1) # [1, 128, 250]
-            # last column take mean
-            generated_mel = outputs.mean(dim=2, keepdim=True)
-            print(f"outputs shape = {generated_mel.size()}") # musicgen shape = [1, 128, 250]
-            target_mel = mel_spectrogram_transform(audio_features).to("cuda")
-            target_mel = target_mel.squeeze(1).mean(dim=2, keepdim=True)
-            print(f"target_mel shape = {target_mel.size()}") # target_mel shape = torch.Size([1, 128, 250])
+            # Process audio tokens: original shape [B, 1, 1, 4, T]
+            tokens = batch["tokens"].to("cuda")
+            # Remove singleton dimensions to get shape [B, T, 4]
+            tokens = tokens.squeeze(1).squeeze(1)
+            B, num_codebooks, T = tokens.shape
 
-            min_time_steps = min(generated_mel.size(-1), target_mel.size(-1)) // 10
-            # print(f"min_time_steps: {min_time_steps}")
-            generated_mel = generated_mel[..., :min_time_steps]
-            target_mel = target_mel[..., :min_time_steps]
+            # Reshape target_music from [B, num_codebooks, T] to [B*num_codebooks, T]
+            target_music = tokens.permute(0, 2, 1)  # Permute to [B, T, num_codebooks]
 
-            # Compute the loss
-            loss = mse_loss(generated_mel, target_mel)
+            outputs = model(
+                input_ids=text_inputs["input_ids"],
+                attention_mask=text_inputs.get("attention_mask", None),
+                labels=target_music
+            )
+            loss = outputs.loss
             loss.backward()
-            # Update model parameters
             optimizer.step()
-            optimizer.zero_grad()  # Clear gradients for the next step
-
-            # Accumulate loss for monitoring
             total_loss += loss.item()
 
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss/len(train_loader)}")
-    # save the trained model
-        model.eval()
-        for audio_features, sampling_rates, text_prompts in valid_loader:
-            audio_features = audio_features.to("cuda")
-            inputs = processor(
-                text=text_prompts,
-                padding=True,
-                return_tensors="pt",
-                truncation=True
-            ).to("cuda")  # Move text inputs to GPU
-            inputs['input_values'] = audio_features # continuation
-            outputs = model(**inputs).logits  # Use `last_hidden_state` or appropriate output
-            outputs = outputs.float()  # Ensure the output is in float format
-            outputs = outputs.to("cuda")
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss:.4f}")
 
-            # take the last 
-            outputs = outputs[-1, :, :].unsqueeze(0) # [1, 250, 2048]
-            outputs = model.custom_linear(outputs) # [1, 250, 128]
-            outputs = outputs.permute(0, 2, 1) # [1, 128, 250]
+    return model
 
-            # last column take mean
-            generated_mel = outputs.mean(dim=2, keepdim=True)
-            print(f"outputs shape = {generated_mel.size()}") # musicgen shape = [1, 128, 250]
-            target_mel = mel_spectrogram_transform(audio_features).to("cuda")
-            target_mel = target_mel.squeeze(1).mean(dim=2, keepdim=True)
-            print(f"target_mel shape = {target_mel.size()}") # target_mel shape = torch.Size([1, 128, 250])
+def save_model(model, path):
+    torch.save(model.state_dict(), path)
+    print(f"Model saved at {path}")
 
-            min_time_steps = min(generated_mel.size(-1), target_mel.size(-1)) // 5
-            # print(f"min_time_steps: {min_time_steps}")
-            generated_mel = generated_mel[..., :min_time_steps]
-            target_mel = target_mel[..., :min_time_steps]
-
-            # Compute the loss
-            loss = mse_loss(generated_mel, target_mel)
-            val_loss = loss.item()
-            # if val_loss < low_val_loss:
-            #     low_val_loss = val_loss
-            #     model_save_path = Path(save_path)
-            #     model_save_path.mkdir(parents=True, exist_ok=True)  # Create the directory
-            #     model.save_pretrained(model_save_path)  # Save the model
-        model_save_path = Path(save_path)
-        model_save_path.mkdir(parents=True, exist_ok=True)  # Create the directory
-        model.save_pretrained(model_save_path)  # Save the model
 
 if __name__ == "__main__":
-    dataset_1 = load_dataset("audiofolder", data_dir="/home/users/wx83/GNN_baseline/590/my_dataset") # only load wav in array
+    print("Loading model...")
+    root_dir = Path("/usr/xtmp/wx83")
+    # ORIGIN_DATASET_PATH = Path("/data") # Change this to your dataset path
+    # PERTURB_DATASET_PATH = Path("/usr/xtmp/wx83/my_perturb_dataset/data") # Change this to your dataset path
+    
+    CURRENT_DATASET_PATH = root_dir / "my_dataset" / "data" # Change this to your dataset path
+    METADATA_PATH = root_dir / "my_dataset" / "metadata.csv" # Change this to your metadata CSV path
+    BATCH_SIZE = 4
+    NUM_EPOCHS = 10
+    OUTPUR_DIR = Path("/home/users/wx83/GNN_baseline/590/model_0228")
 
-    dataset_2 = load_dataset("audiofolder", data_dir="/home/users/wx83/GNN_baseline/590/my_perturb_dataset")
+    model, processor = load_model()
+    print(f" MusicGen model configuration = {model.config.decoder_start_token_id}")
+    origin_train_dataset = load_and_process_dataset(model, CURRENT_DATASET_PATH, METADATA_PATH)
+    print(f"Loaded origin dataset with {len(origin_train_dataset)} samples.")
 
-    dataset_train_ori = dataset_1['train']
-    dataset_val_ori = dataset_1['validation']
-    subset_train_ori = Subset(dataset_train_ori, range(300))  # Use a subset of the training data for faster training
-    subset_valid_ori = Subset(dataset_val_ori, range(50))
-    train_dataloader_ori = DataLoader(subset_train_ori, batch_size=1, shuffle=True, collate_fn=collate_fn)
-    valid_dataloader_ori = DataLoader(subset_valid_ori, batch_size=1, shuffle=False, collate_fn=collate_fn)
+    # Define how many samples to use (e.g., 10% of the dataset)
+    fraction_to_use = 0.5 # use 50% for training for faster iteration
+    num_samples = int(len(origin_train_dataset) * fraction_to_use)
+    subset_indices = list(range(num_samples))
 
+    # Create a subset of the dataset
+    subset_train_dataset = Subset(origin_train_dataset, subset_indices)
+    print(f"Using subset with {len(subset_train_dataset)} samples.")
 
+    # Create DataLoader using the subset
+    origin_train_loader = DataLoader(
+        subset_train_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        collate_fn=custom_collate_fn
+    )
 
-    dataset_train_perb= dataset_2['train']
-    dataset_val_perb = dataset_2['validation']
-    subset_train_perb = Subset(dataset_train_perb, range(300))  # Use a subset of the training data for faster training
-    train_dataloader_perb = DataLoader(subset_train_perb, batch_size=1, shuffle=True, collate_fn=collate_fn)
-    valid_dataloader_perb = DataLoader(dataset_2['validation'], batch_size=1, shuffle=False, collate_fn=collate_fn)
+    # Train model using the subset
+    model = train_model(model, origin_train_loader, processor, num_epochs=NUM_EPOCHS)
 
-
-
-    # Create two subsets of 150 samples each
-    subset1 = Subset(dataset_train_ori, range(150))
-    subset2 = Subset(dataset_train_perb, range(150, 300))
-
-    subset1_val= Subset(dataset_val_ori, range(25))
-    subset2_val = Subset(dataset_val_perb, range(25))
-
-    # Combine the two subsets into a single dataset
-    combined_dataset = ConcatDataset([subset1, subset2])
-    combined_dataset_val = ConcatDataset([subset1_val, subset2_val])
-
-    train_dataloader_mix = DataLoader(combined_dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
-    valid_dataloader_mix = DataLoader(combined_dataset_val, batch_size=1, shuffle=False, collate_fn=collate_fn)
-
-    # model_training(train_dataloader_ori, valid_dataloader_ori, "/home/users/wx83/GNN_baseline/590/model/model_ori")
-    # model_training(train_dataloader_perb, valid_dataloader_perb, "/home/users/wx83/GNN_baseline/590/model/model_perb")
-    model_training(train_dataloader_mix, valid_dataloader_mix, "/home/users/wx83/GNN_baseline/590/model/model_mix")
+    # Save model
+    output_path = OUTPUR_DIR / "origin_model.pth"
+    save_model(model, output_path)
