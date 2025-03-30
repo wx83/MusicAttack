@@ -22,9 +22,7 @@ def generation(model_path, text_prompt, save_dir, save_name):
     audio_values = model.generate(**inputs, max_new_tokens=256)
 
 
-
-    # Assuming `sampling_rate` is defined somewhere in your code, or use a default value
-    sampling_rate = 16000  # Example sampling rate, adjust as needed
+    sampling_rate =32000  # Example sampling rate, adjust as needed
 
     # Move the tensor to the CPU and convert to a NumPy array
     audio_values_cpu = audio_values[0, 0].cpu().numpy()

@@ -80,7 +80,7 @@ def load_and_process_dataset(model, data_dir, metadata_csv):
         key = str(relative_path)  # key will be "data/train/_0-2meOf9qY_1.wav"
         # print(f"text search key = {key}")  # Debug: Check the key used for lookup
         example["text"] = metadata_dict.get(key, "")
-        print(f"example text = {example['text']}")  # Debug: Check the text prompt added to the example
+        print(f"example text = {example['text']}")  # Debug: Check the text prompt added to the example: checked, some of have paired text, some of empty
         return example
     
     processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
